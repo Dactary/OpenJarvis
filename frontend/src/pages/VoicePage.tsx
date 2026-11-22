@@ -1,7 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { apiFetch, fetchModels, fetchServerInfo, synthesizeSpeech } from '../lib/api';
+import {
+  apiFetch,
+  approveAction,
+  denyAction,
+  fetchModels,
+  fetchPendingApprovals,
+  fetchServerInfo,
+  synthesizeSpeech,
+} from '../lib/api';
 import { stripThinkTags, toSpeakableText } from '../lib/message-text';
 import { useAppStore } from '../lib/store';
+import {
+  TOOL_CONFIRMATION,
+  describeToolRequest,
+  parseConfirmation,
+  type ToolRequest,
+} from '../lib/voice-confirm';
 import { isWhisperHallucination } from '../lib/voice-hallucinations';
 import { VoiceActivityDetector } from '../lib/voice-vad';
 
@@ -288,6 +302,14 @@ async function transcribe(audio: Blob, language: SpeechLanguage): Promise<string
 const WAKE_URL = 'http://127.0.0.1:8771/events';
 const WAKE_RETRY_MS = 10000;
 
+/** A sensitive tool call waiting for the user's go-ahead. */
+interface PendingConfirm extends ToolRequest {
+  id: string;
+}
+const CONFIRM_POLL_MS = 700;
+/** Time to answer "oui" or "non" aloud; the buttons stay available meanwhile. */
+const CONFIRM_LISTEN_MS = 8000;
+
 const MAX_HISTORY = 20;
 const MAX_SPOKEN_CHARS = 4800; // the server refuses more than 5000
 const BARS = 96;
@@ -384,6 +406,9 @@ export function VoicePage() {
   const playerUrlRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const finishListeningRef = useRef<(send: boolean) => void>(() => {});
+  const [confirm, setConfirm] = useState<PendingConfirm | null>(null);
+  const confirmRef = useRef<PendingConfirm | null>(null);
+  const confirmBusyRef = useRef(false); // a pending-approvals check is in flight
 
   useEffect(() => { modelRef.current = model; }, [model]);
 
@@ -482,6 +507,13 @@ export function VoicePage() {
     vadRef.current = null;
     releasePlayer();
     releaseMic();
+    const pending = confirmRef.current;
+    if (pending) {
+      // Walking away from the question is a refusal, not a silent timeout.
+      confirmRef.current = null;
+      setConfirm(null);
+      void denyAction(pending.id).catch(() => {});
+    }
     setFollowUp(false);
     setPhase('idle');
   }, [releaseMic, releasePlayer, setPhase]);
@@ -497,7 +529,15 @@ export function VoicePage() {
    * Open the microphone for one utterance. A follow-up (Jarvis re-listening on
    * its own after an answer) gives up sooner than a turn the user asked for.
    */
-  const startListening = useCallback(async (opts: { followUpMs?: number } = {}) => {
+  const startListening = useCallback(async (
+    opts: { followUpMs?: number; keepRun?: boolean } = {},
+  ) => {
+    // A new run of its own: if a second start arrives while the browser is
+    // still opening the microphone (wake word + click), the first one gives up
+    // instead of leaving a second stream and recorder running. `keepRun` is for
+    // listening to a yes/no while the question that prompted it is still being
+    // answered by the server: that request must stay alive.
+    if (!opts.keepRun) runRef.current += 1;
     const run = runRef.current;
     const isFollowUp = opts.followUpMs !== undefined;
     if (!isFollowUp) followUpsRef.current = 0; // wake word / click: fresh exchange
@@ -541,9 +581,29 @@ export function VoicePage() {
       );
       setPhase('listening');
     } catch {
+      if (run !== runRef.current) return; // superseded: not this start's error to report
       fail("Accès au microphone refusé. Autorisez-le dans le navigateur, puis réessayez.");
     }
   }, [ensureAudio, fail, setPhase]);
+
+  /** Play one synthesized clip through the analyser that drives the visual. */
+  const playAudio = useCallback(async (blob: Blob, run: number, onEnded: () => void) => {
+    const ctx = await ensureAudio();
+    if (run !== runRef.current) return;
+    releasePlayer();
+    const url = URL.createObjectURL(blob);
+    const el = new Audio(url);
+    playerUrlRef.current = url;
+    playerRef.current = el;
+    const source = ctx.createMediaElementSource(el);
+    if (outAnalyserRef.current) source.connect(outAnalyserRef.current);
+    playerSourceRef.current = source;
+    el.onended = onEnded;
+    el.onerror = () => {
+      if (run === runRef.current) fail('La lecture audio a échoué.');
+    };
+    await el.play();
+  }, [ensureAudio, fail, releasePlayer]);
 
   const speak = useCallback(async (text: string, run: number) => {
     const spoken = toSpeakableText(text).slice(0, MAX_SPOKEN_CHARS);
@@ -570,21 +630,94 @@ export function VoicePage() {
     abortRef.current = ac;
     const blob = await synthesizeSpeech(spoken, { signal: ac.signal });
     if (run !== runRef.current) return;
+    await playAudio(blob, run, finish);
+  }, [playAudio, releasePlayer, setPhase, startListening, stopAll]);
 
-    const ctx = await ensureAudio();
-    const url = URL.createObjectURL(blob);
-    const el = new Audio(url);
-    playerUrlRef.current = url;
-    playerRef.current = el;
-    const source = ctx.createMediaElementSource(el);
-    if (outAnalyserRef.current) source.connect(outAnalyserRef.current);
-    playerSourceRef.current = source;
-    el.onended = finish;
-    el.onerror = () => {
-      if (run === runRef.current) fail('La lecture audio a échoué.');
-    };
-    await el.play();
-  }, [ensureAudio, fail, releasePlayer, setPhase, startListening, stopAll]);
+  // --- confirmation of sensitive tools ---------------------------------------
+
+  /** Send the user's decision; the server then resumes (or refuses) the tool. */
+  const resolveConfirm = useCallback(async (approved: boolean, note?: string) => {
+    const pending = confirmRef.current;
+    if (!pending) return;
+    confirmRef.current = null;
+    setConfirm(null);
+    // The decision may come from a button while the question is still being
+    // read or the microphone is open: stop both.
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.onstop = null;
+      recorder.stop();
+    }
+    chunksRef.current = [];
+    vadRef.current = null;
+    releasePlayer();
+    setFollowUp(false);
+    setPhase('thinking'); // the model's answer is still on its way
+    if (note) setError(note);
+    try {
+      await (approved ? approveAction : denyAction)(pending.id);
+    } catch {
+      setError("La décision n'a pas pu être transmise au serveur : l'action reste refusée.");
+    }
+  }, [releasePlayer, setPhase]);
+
+  /** Read the question aloud, then listen for "oui" or "non". */
+  const askConfirmation = useCallback(async (pending: PendingConfirm, run: number) => {
+    confirmRef.current = pending;
+    setConfirm(pending);
+    setError(null);
+    const current = () => run === runRef.current && confirmRef.current?.id === pending.id;
+    try {
+      setPhase('speaking');
+      const blob = await synthesizeSpeech(pending.spoken);
+      if (!current()) return;
+      await playAudio(blob, run, () => {
+        if (!current()) return;
+        releasePlayer();
+        void startListening({ followUpMs: CONFIRM_LISTEN_MS, keepRun: true });
+      });
+    } catch {
+      // No voice available: the buttons on screen still work.
+      if (current()) setPhase('thinking');
+    }
+  }, [playAudio, releasePlayer, setPhase, startListening]);
+
+  /** While the model works, see whether a tool is waiting for a go-ahead. */
+  const checkConfirmation = useCallback(async (run: number, since: number) => {
+    if (run !== runRef.current || confirmRef.current || confirmBusyRef.current) return;
+    confirmBusyRef.current = true;
+    try {
+      const actions = await fetchPendingApprovals();
+      if (run !== runRef.current || confirmRef.current) return;
+      // Only requests raised by this question: an older one belongs to an
+      // exchange the user already abandoned.
+      const action = actions.find(
+        (a) => a.action_type === TOOL_CONFIRMATION && Date.parse(a.created_at) >= since,
+      );
+      if (action) {
+        void askConfirmation({ id: action.id, ...describeToolRequest(action.payload) }, run);
+      }
+    } catch {
+      // Server busy or restarting: the next tick tries again.
+    } finally {
+      confirmBusyRef.current = false;
+    }
+  }, [askConfirmation]);
+
+  const answerConfirmation = useCallback(async (audio: Blob, run: number) => {
+    let verdict: 'yes' | 'no' | null = null;
+    try {
+      verdict = parseConfirmation(await transcribe(audio, languageRef.current));
+    } catch {
+      verdict = null;
+    }
+    if (run !== runRef.current) return;
+    await resolveConfirm(
+      verdict === 'yes',
+      verdict === null ? "Je n'ai pas compris de « oui » clair : action refusée." : undefined,
+    );
+  }, [resolveConfirm]);
 
   const processUtterance = useCallback(async (audio: Blob, run: number) => {
     setPhase('thinking');
@@ -614,19 +747,30 @@ export function VoicePage() {
       const history = [...historyRef.current, { role: 'user' as const, content: transcript }];
       const ac = new AbortController();
       abortRef.current = ac;
-      const res = await apiFetch('/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: chatModel,
-          messages: [
-            { role: 'system', content: `${PERSONAS[personaRef.current].prompt} ${VOICE_RULES}` },
-            ...history,
-          ],
-          stream: false,
-        }),
-        signal: ac.signal,
-      });
+      const askedAt = Date.now() - 1000; // small margin for clock rounding
+      const poll = setInterval(() => void checkConfirmation(run, askedAt), CONFIRM_POLL_MS);
+      let res: Response;
+      try {
+        res = await apiFetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: chatModel,
+            messages: [
+              { role: 'system', content: `${PERSONAS[personaRef.current].prompt} ${VOICE_RULES}` },
+              ...history,
+            ],
+            stream: false,
+          }),
+          signal: ac.signal,
+        });
+      } finally {
+        clearInterval(poll);
+      }
+      // The server answered while a question was still open (it timed out
+      // there and refused): take the panel down.
+      if (confirmRef.current) await resolveConfirm(false);
+      if (run !== runRef.current) return;
       if (!res.ok) throw new Error(`Le modèle a répondu par une erreur (${res.status}).`);
       const data = await res.json();
       if (run !== runRef.current) return;
@@ -643,7 +787,7 @@ export function VoicePage() {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       fail(err instanceof Error ? err.message : 'Une erreur est survenue.');
     }
-  }, [fail, resolveModel, setPhase, speak, stopAll]);
+  }, [checkConfirmation, fail, resolveConfirm, resolveModel, setPhase, speak, stopAll]);
 
   /** End the recording; `send` false means the user said nothing. */
   const finishListening = useCallback((send: boolean) => {
@@ -653,7 +797,16 @@ export function VoicePage() {
     recorderRef.current = null;
     vadRef.current = null;
 
+    const confirming = confirmRef.current !== null;
     if (!send) {
+      if (confirming) {
+        // Silence is not a yes. Stop the recorder, refuse, keep the exchange.
+        recorder.onstop = null;
+        recorder.stop();
+        chunksRef.current = [];
+        void resolveConfirm(false, 'Pas de réponse : action refusée.');
+        return;
+      }
       stopAll();
       return;
     }
@@ -661,16 +814,18 @@ export function VoicePage() {
       if (run !== runRef.current) return;
       const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' });
       chunksRef.current = [];
-      void processUtterance(blob, run);
+      if (confirming) void answerConfirmation(blob, run);
+      else void processUtterance(blob, run);
     };
     setPhase('thinking');
     recorder.stop();
-  }, [processUtterance, setPhase, stopAll]);
+  }, [answerConfirmation, processUtterance, resolveConfirm, setPhase, stopAll]);
 
   useEffect(() => { finishListeningRef.current = finishListening; }, [finishListening]);
 
   /** Barge-in: cut the answer short and listen to the user again. */
   const interruptAndListen = useCallback(() => {
+    if (confirmRef.current) return; // a yes/no is pending: answer it or press Escape
     runRef.current += 1;
     abortRef.current?.abort();
     releasePlayer();
@@ -687,7 +842,7 @@ export function VoicePage() {
       finishListening(vadRef.current?.speaking ?? false);
     } else if (current === 'speaking') {
       interruptAndListen();
-    } else {
+    } else if (!confirmRef.current) {
       stopAll();
     }
   }, [finishListening, interruptAndListen, startListening, stopAll]);
@@ -987,8 +1142,68 @@ export function VoicePage() {
                   : 'var(--color-accent)',
           }}
         >
-          {phase === 'listening' && followUp ? 'Autre chose ? Je vous écoute encore…' : STATUS[phase]}
+          {confirm
+            ? phase === 'listening'
+              ? 'Dites « oui » ou « non »…'
+              : 'Confirmation demandée'
+            : phase === 'listening' && followUp
+              ? 'Autre chose ? Je vous écoute encore…'
+              : STATUS[phase]}
         </p>
+
+        {confirm && (
+          <div
+            className="mt-4 rounded-xl p-4 text-left"
+            role="alertdialog"
+            aria-label="Confirmation demandée"
+            style={{
+              background: 'var(--color-bg-secondary)',
+              border: '1px solid var(--color-warning)',
+            }}
+          >
+            <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+              Jarvis demande à exécuter : {confirm.title}
+            </p>
+            <pre
+              className="mt-2 rounded-lg p-2.5 text-xs overflow-auto"
+              style={{
+                maxHeight: '9rem',
+                background: 'var(--color-bg-tertiary)',
+                color: 'var(--color-text-secondary)',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {confirm.detail}
+            </pre>
+            <div className="mt-3 flex gap-2">
+              <button
+                type="button"
+                onClick={() => void resolveConfirm(true)}
+                className="flex-1 py-1.5 rounded-lg text-sm font-semibold cursor-pointer"
+                style={{
+                  background: 'color-mix(in srgb, var(--color-success) 14%, transparent)',
+                  color: 'var(--color-success)',
+                  border: '1px solid color-mix(in srgb, var(--color-success) 30%, transparent)',
+                }}
+              >
+                Autoriser
+              </button>
+              <button
+                type="button"
+                onClick={() => void resolveConfirm(false)}
+                className="flex-1 py-1.5 rounded-lg text-sm font-semibold cursor-pointer"
+                style={{
+                  background: 'color-mix(in srgb, var(--color-error) 14%, transparent)',
+                  color: 'var(--color-error)',
+                  border: '1px solid color-mix(in srgb, var(--color-error) 30%, transparent)',
+                }}
+              >
+                Refuser
+              </button>
+            </div>
+          </div>
+        )}
 
         {error && (
           <p className="mt-3 text-sm" style={{ color: 'var(--color-error)' }}>

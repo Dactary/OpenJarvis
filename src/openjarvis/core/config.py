@@ -1442,6 +1442,9 @@ class SecurityConfig:
         default_factory=lambda: str(get_config_dir() / "audit.db")
     )
     enforce_tool_confirmation: bool = True
+    # Extra tools the API server must get the user's go-ahead for, on top of
+    # those whose own spec requires confirmation (e.g. ["code_interpreter"]).
+    confirm_tools: List[str] = field(default_factory=list)
     merkle_audit: bool = True
     signing_key_path: str = ""
     ssrf_protection: bool = True

@@ -488,6 +488,13 @@ def serve(
                     rate_limiter=sec.rate_limiter,
                     agent_id=agent_key,
                 )
+                # The server has no terminal to ask on: route confirmations for
+                # sensitive tools through the approval queue shown in the GUI.
+                from openjarvis.server.tool_confirmation import (
+                    enable_tool_confirmation,
+                )
+
+                enable_tool_confirmation(agent, config.security.confirm_tools)
                 # Pin MCP transports to the agent's lifetime so HTTP
                 # connections don't close mid-request (#461).
                 if mcp_clients:

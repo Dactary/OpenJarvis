@@ -79,8 +79,11 @@ export class VoiceActivityDetector {
         }
       } else {
         this.loudSince = null;
-        // Keep tracking slow drifts in room noise while we wait.
-        this.noise = 0.95 * this.noise + 0.05 * rms;
+        // Follow the room noise: down quickly, up slowly. If the user was
+        // already talking during calibration (or a beep was playing), the
+        // floor starts too high; the first gap between words brings it back
+        // down instead of the floor chasing the voice until the timeout.
+        this.noise += (rms - this.noise) * (rms < this.noise ? 0.3 : 0.01);
       }
       if (this.speechStartedAt === null && elapsed >= this.opts.noSpeechTimeoutMs) {
         return 'timeout';

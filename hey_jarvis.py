@@ -277,7 +277,11 @@ def main():
         return
 
     diffuseur = Diffuseur()
-    serveur = creer_serveur(diffuseur, options.port)
+    try:
+        serveur = creer_serveur(diffuseur, options.port)
+    except OSError as erreur:
+        sys.exit(f"Port {options.port} indisponible ({erreur}). hey_jarvis.py tourne "
+                 "peut-être déjà ; sinon choisissez un autre port avec --port.")
     threading.Thread(target=serveur.serve_forever, name="reveil-sse", daemon=True).start()
     print(f"Réveils diffusés sur http://127.0.0.1:{options.port}/events "
           "(page « Voix » du GUI).")

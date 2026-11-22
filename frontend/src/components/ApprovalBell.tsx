@@ -37,7 +37,8 @@ export function ApprovalBell() {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 10000);
+    // Short interval: a tool waiting for confirmation blocks the answer.
+    const id = setInterval(load, 3000);
     return () => clearInterval(id);
   }, [load]);
 

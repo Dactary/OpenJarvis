@@ -15,6 +15,7 @@
 #   python outils_quotidien.py --essai meteo ville=Lyon
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -73,7 +74,8 @@ def date_en_clair(moment):
 
 
 def heure_en_clair(moment):
-    return f"{moment.hour} heures" if moment.minute == 0 else f"{moment.hour} heures {moment.minute:02d}"
+    heures = f"{moment.hour} heure{'s' if moment.hour > 1 else ''}"
+    return heures if moment.minute == 0 else f"{heures} {moment.minute:02d}"
 
 
 def heure_et_date():
@@ -85,6 +87,7 @@ def heure_et_date():
 
 _MINUTEURS = {}            # numéro -> {"libelle", "fin", "fil"}
 _VERROU = threading.Lock()
+_VERROU_SON = threading.Lock()
 _PROCHAIN = [1]
 
 
@@ -145,13 +148,16 @@ def _sonner(numero):
     if minuteur is None:
         return  # annulé entre-temps
     libelle = minuteur["libelle"]
-    annoncer(f"Le minuteur {libelle} est terminé." if libelle else "Le minuteur est terminé.")
+    with _VERROU_SON:   # deux minuteurs qui finissent ensemble sonnent l'un après l'autre
+        annoncer(f"Le minuteur {libelle} est terminé." if libelle else "Le minuteur est terminé.")
 
 
 def lancer_minuteur(secondes=0, minutes=0, libelle=""):
     try:
         total = float(secondes or 0) + 60 * float(minutes or 0)
     except (TypeError, ValueError):
+        return "Je n'ai pas compris la durée du minuteur."
+    if not math.isfinite(total):
         return "Je n'ai pas compris la durée du minuteur."
     if total < 1:
         return "Il me faut une durée d'au moins une seconde."

@@ -67,6 +67,15 @@ describe('VoiceActivityDetector', () => {
     expect(vad.speaking).toBe(true);
   });
 
+  it('still hears a user who was already talking during calibration', () => {
+    const vad = new VoiceActivityDetector();
+    const clock = { t: 0 };
+    feed(vad, clock, 0.2, 400); // "Hey Jarvis, ..." said in one breath
+    feed(vad, clock, 0.005, 150); // gap between two words
+    feed(vad, clock, 0.2, 300);
+    expect(vad.speaking).toBe(true);
+  });
+
   it('caps a never-ending utterance', () => {
     const vad = new VoiceActivityDetector({ maxUtteranceMs: 3000 });
     const clock = { t: 0 };

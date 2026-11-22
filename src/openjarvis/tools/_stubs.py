@@ -190,6 +190,10 @@ class ToolExecutor:
         Optional event bus for publishing ``TOOL_CALL_START``/``TOOL_CALL_END``.
     """
 
+    def require_confirmation_for(self, names) -> None:
+        """Also ask the user before running the named tools."""
+        self._confirm_names.update(str(n) for n in names if n)
+
     def __init__(
         self,
         tools: List[BaseTool],
@@ -212,6 +216,8 @@ class ToolExecutor:
         self._agent_id = agent_id
         self._boundary_guard = boundary_guard
         self._rate_limiter = rate_limiter
+        # Tools confirmed by name even when their spec does not ask for it.
+        self._confirm_names: set = set()
         # Running taint accumulated across this executor's tool calls. Data
         # detected as PII/secret in one tool's output taints every later call,
         # so a sink-policy violation (e.g. secret -> http_request) is caught
@@ -398,7 +404,7 @@ class ToolExecutor:
             params.pop("_taint", None)
 
         # Confirmation check for sensitive tools
-        if tool.spec.requires_confirmation:
+        if tool.spec.requires_confirmation or tool_call.name in self._confirm_names:
             if not self._interactive or self._confirm_callback is None:
                 return ToolResult(
                     tool_name=tool_call.name,
