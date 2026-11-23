@@ -24,6 +24,36 @@ interface TraceSummary {
   created_at: string;
 }
 
+/**
+ * The API returns steps as { step_type, duration_seconds, input, output,
+ * metadata }; older builds sent { duration_ms, data }. Accept both, so a
+ * step never reaches the view without a duration or a data object.
+ */
+export function normalizeTrace(raw: Record<string, unknown>): TraceSummary {
+  const steps = Array.isArray(raw.steps) ? raw.steps : [];
+  return {
+    id: String(raw.id ?? ''),
+    query: String(raw.query ?? ''),
+    created_at: String(raw.created_at ?? ''),
+    steps: steps.map((s: Record<string, unknown>) => {
+      const ms = typeof s.duration_ms === 'number'
+        ? s.duration_ms
+        : typeof s.duration_seconds === 'number' ? s.duration_seconds * 1000 : 0;
+      const data = s.data && typeof s.data === 'object'
+        ? (s.data as TraceStepData)
+        : { input: s.input, output: s.output, metadata: s.metadata } as TraceStepData;
+      return { step_type: String(s.step_type ?? 'step'), duration_ms: ms, data };
+    }),
+  };
+}
+
+/** A value is worth showing when it is not null and not an empty object. */
+function hasContent(value: unknown): boolean {
+  if (value == null) return false;
+  if (typeof value === 'object') return Object.keys(value as object).length > 0;
+  return true;
+}
+
 const STEP_COLORS: Record<string, string> = {
   route: 'var(--color-accent)',
   retrieve: 'var(--color-success)',
@@ -75,7 +105,7 @@ function TraceCard({ trace, isActive, onClick }: { trace: TraceSummary; isActive
 
 function StepDetail({ step, index }: { step: TraceStep; index: number }) {
   const [expanded, setExpanded] = useState(false);
-  const dataEntries = Object.entries(step.data).filter(([_, v]) => v != null);
+  const dataEntries = Object.entries(step.data ?? {}).filter(([, v]) => hasContent(v));
 
   return (
     <div
@@ -107,7 +137,7 @@ function StepDetail({ step, index }: { step: TraceStep; index: number }) {
               <span className="font-mono shrink-0" style={{ color: 'var(--color-text-tertiary)', minWidth: '80px' }}>
                 {key}
               </span>
-              <span className="truncate" style={{ color: 'var(--color-text-secondary)' }}>
+              <span className="break-words min-w-0" style={{ color: 'var(--color-text-secondary)' }}>
                 {typeof value === 'object' ? JSON.stringify(value) : String(value)}
               </span>
             </div>
@@ -129,7 +159,7 @@ export function TraceDebugger() {
       const res = await fetch(`${base}/v1/traces?limit=50`, { headers: authHeaders() });
       if (!res.ok) throw new Error();
       const data = await res.json();
-      setTraces(data.traces || []);
+      setTraces((data.traces || []).map(normalizeTrace));
       setError(null);
     } catch {
       setError('Cannot load traces');
